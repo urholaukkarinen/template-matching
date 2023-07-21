@@ -9,6 +9,7 @@
 use std::{borrow::Cow, mem::size_of};
 use wgpu::util::DeviceExt;
 
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum MatchTemplateMethod {
     SumOfAbsoluteDifferences,
     SumOfSquaredDifferences,
@@ -97,6 +98,15 @@ pub struct Extremes {
     pub max_value_location: (u32, u32),
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShaderUniforms {
+    input_width: u32,
+    input_height: u32,
+    template_width: u32,
+    template_height: u32,
+}
+
 pub struct TemplateMatcher {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -105,6 +115,19 @@ pub struct TemplateMatcher {
     shader: wgpu::ShaderModule,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
+
+    last_pipeline: Option<wgpu::ComputePipeline>,
+    last_method: Option<MatchTemplateMethod>,
+
+    last_input_size: (u32, u32),
+    last_template_size: (u32, u32),
+
+    uniform_buffer: wgpu::Buffer,
+    input_buffer: Option<wgpu::Buffer>,
+    template_buffer: Option<wgpu::Buffer>,
+    result_buffer: Option<wgpu::Buffer>,
+    staging_buffer: Option<wgpu::Buffer>,
+    bind_group: Option<wgpu::BindGroup>,
 }
 
 impl Default for TemplateMatcher {
@@ -199,6 +222,13 @@ impl TemplateMatcher {
             push_constant_ranges: &[],
         });
 
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniform_buffer"),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: size_of::<ShaderUniforms>() as _,
+            mapped_at_creation: false,
+        });
+
         Self {
             instance,
             adapter,
@@ -207,11 +237,21 @@ impl TemplateMatcher {
             shader,
             pipeline_layout,
             bind_group_layout,
+            last_pipeline: None,
+            last_method: None,
+            last_input_size: (0, 0),
+            last_template_size: (0, 0),
+            uniform_buffer,
+            input_buffer: None,
+            template_buffer: None,
+            result_buffer: None,
+            staging_buffer: None,
+            bind_group: None,
         }
     }
 
     pub fn match_template<'a>(
-        &self,
+        &mut self,
         input: impl Into<Image<'a>>,
         template: impl Into<Image<'a>>,
         method: MatchTemplateMethod,
@@ -219,100 +259,122 @@ impl TemplateMatcher {
         let input = input.into();
         let template = template.into();
 
-        let entry_point = match method {
-            MatchTemplateMethod::SumOfAbsoluteDifferences => "main_sad",
-            MatchTemplateMethod::SumOfSquaredDifferences => "main_ssd",
-        };
+        if self.last_pipeline.is_none() || self.last_method != Some(method) {
+            self.last_method = Some(method);
 
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: None,
-                layout: Some(&self.pipeline_layout),
-                module: &self.shader,
-                entry_point,
-            });
+            let entry_point = match method {
+                MatchTemplateMethod::SumOfAbsoluteDifferences => "main_sad",
+                MatchTemplateMethod::SumOfSquaredDifferences => "main_ssd",
+            };
 
-        let input_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("input_buffer"),
-                contents: bytemuck::cast_slice(&input.data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let template_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("template_buffer"),
-                contents: bytemuck::cast_slice(&template.data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let result_width = (input.width - template.width + 1) as usize;
-        let result_height = (input.height - template.height + 1) as usize;
-        let result_size = (result_width * result_height) as u64 * size_of::<f32>() as u64;
-
-        let result_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("result_buffer"),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            size: result_size,
-            mapped_at_creation: false,
-        });
-
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_buffer"),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            size: result_size,
-            mapped_at_creation: false,
-        });
-
-        #[repr(C)]
-        #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-        pub struct Uniforms {
-            input_width: u32,
-            input_height: u32,
-            template_width: u32,
-            template_height: u32,
+            self.last_pipeline = Some(self.device.create_compute_pipeline(
+                &wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&self.pipeline_layout),
+                    module: &self.shader,
+                    entry_point,
+                },
+            ));
         }
 
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("uniform_buffer"),
-                contents: bytemuck::cast_slice(&[Uniforms {
+        let mut buffers_changed = false;
+
+        let input_size = (input.width, input.height);
+        if self.input_buffer.is_none() || self.last_input_size != input_size {
+            buffers_changed = true;
+
+            self.last_input_size = input_size;
+
+            self.input_buffer = Some(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("input_buffer"),
+                    contents: bytemuck::cast_slice(&input.data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+        } else {
+            self.queue.write_buffer(
+                self.input_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&input.data),
+            );
+        }
+
+        let template_size = (template.width, template.height);
+        if self.template_buffer.is_none() || self.last_template_size != template_size {
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[ShaderUniforms {
                     input_width: input.width,
                     input_height: input.height,
                     template_width: template.width,
                     template_height: template.height,
                 }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+            );
+            buffers_changed = true;
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
+            self.last_template_size = template_size;
+
+            self.template_buffer = Some(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("template_buffer"),
+                    contents: bytemuck::cast_slice(&template.data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: template_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: result_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-            ],
-        });
+            ));
+        } else {
+            self.queue.write_buffer(
+                self.template_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&template.data),
+            );
+        }
+
+        let result_width = (input.width - template.width + 1) as usize;
+        let result_height = (input.height - template.height + 1) as usize;
+        let result_size = (result_width * result_height) as u64 * size_of::<f32>() as u64;
+
+        if buffers_changed {
+            self.result_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("result_buffer"),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                size: result_size,
+                mapped_at_creation: false,
+            }));
+
+            self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("staging_buffer"),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                size: result_size,
+                mapped_at_creation: false,
+            }));
+
+            self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.input_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.template_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.result_buffer.as_ref().unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
 
         let mut encoder = self
             .device
@@ -324,8 +386,8 @@ impl TemplateMatcher {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("compute_pass"),
             });
-            compute_pass.set_pipeline(&pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.set_pipeline(self.last_pipeline.as_ref().unwrap());
+            compute_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
             compute_pass.dispatch_workgroups(
                 (result_width as f32 / 16.0).ceil() as u32,
                 (result_height as f32 / 16.0).ceil() as u32,
@@ -333,11 +395,17 @@ impl TemplateMatcher {
             );
         }
 
-        encoder.copy_buffer_to_buffer(&result_buffer, 0, &staging_buffer, 0, result_size);
+        encoder.copy_buffer_to_buffer(
+            self.result_buffer.as_ref().unwrap(),
+            0,
+            self.staging_buffer.as_ref().unwrap(),
+            0,
+            result_size,
+        );
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
+        let buffer_slice = self.staging_buffer.as_ref().unwrap().slice(..);
         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
@@ -350,7 +418,7 @@ impl TemplateMatcher {
                 let data = buffer_slice.get_mapped_range();
                 result = bytemuck::cast_slice(&data).to_vec();
                 drop(data);
-                staging_buffer.unmap();
+                self.staging_buffer.as_ref().unwrap().unmap();
             } else {
                 result = vec![0.0; result_width * result_height]
             };
