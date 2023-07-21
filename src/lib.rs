@@ -19,8 +19,9 @@ pub enum MatchTemplateMethod {
 ///
 /// This is a shorthand for:
 /// ```ignore
-/// let matcher = TemplateMatcher::new();
+/// let mut matcher = TemplateMatcher::new();
 /// matcher.match_template(input, template, method);
+/// matcher.wait_for_result().unwrap()
 /// ```
 /// You can use  [find_extremes] to find minimum and maximum values, and their locations in the result image.
 pub fn match_template<'a>(
@@ -28,7 +29,9 @@ pub fn match_template<'a>(
     template: impl Into<Image<'a>>,
     method: MatchTemplateMethod,
 ) -> Image<'static> {
-    TemplateMatcher::new().match_template(input, template, method)
+    let mut matcher = TemplateMatcher::new();
+    matcher.match_template(input, template, method);
+    matcher.wait_for_result().unwrap()
 }
 
 /// Finds the smallest and largest values and their locations in an image.
@@ -100,7 +103,7 @@ pub struct Extremes {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ShaderUniforms {
+struct ShaderUniforms {
     input_width: u32,
     input_height: u32,
     template_width: u32,
@@ -121,6 +124,7 @@ pub struct TemplateMatcher {
 
     last_input_size: (u32, u32),
     last_template_size: (u32, u32),
+    last_result_size: (u32, u32),
 
     uniform_buffer: wgpu::Buffer,
     input_buffer: Option<wgpu::Buffer>,
@@ -128,6 +132,8 @@ pub struct TemplateMatcher {
     result_buffer: Option<wgpu::Buffer>,
     staging_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
+
+    matching_ongoing: bool,
 }
 
 impl Default for TemplateMatcher {
@@ -241,21 +247,62 @@ impl TemplateMatcher {
             last_method: None,
             last_input_size: (0, 0),
             last_template_size: (0, 0),
+            last_result_size: (0, 0),
             uniform_buffer,
             input_buffer: None,
             template_buffer: None,
             result_buffer: None,
             staging_buffer: None,
             bind_group: None,
+            matching_ongoing: false,
         }
     }
 
+    /// Waits for the latest [match_template] execution and returns the result.
+    /// Returns [None] if no matching was started.
+    pub fn wait_for_result(&mut self) -> Option<Image<'static>> {
+        if !self.matching_ongoing {
+            return None;
+        }
+        self.matching_ongoing = false;
+
+        let (result_width, result_height) = self.last_result_size;
+
+        let buffer_slice = self.staging_buffer.as_ref().unwrap().slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        pollster::block_on(async {
+            let result;
+
+            if let Some(Ok(())) = receiver.receive().await {
+                let data = buffer_slice.get_mapped_range();
+                result = bytemuck::cast_slice(&data).to_vec();
+                drop(data);
+                self.staging_buffer.as_ref().unwrap().unmap();
+            } else {
+                result = vec![0.0; (result_width * result_height) as usize]
+            };
+
+            Some(Image::new(result, result_width as _, result_height as _))
+        })
+    }
+
+    /// Slides a template over the input and scores the match at each point using the requested method.
+    /// To get the result of the matching, call [wait_for_result].
     pub fn match_template<'a>(
         &mut self,
         input: impl Into<Image<'a>>,
         template: impl Into<Image<'a>>,
         method: MatchTemplateMethod,
-    ) -> Image<'static> {
+    ) {
+        if self.matching_ongoing {
+            // Discard previous result if not collected.
+            self.wait_for_result();
+        }
+
         let input = input.into();
         let template = template.into();
 
@@ -331,24 +378,26 @@ impl TemplateMatcher {
             );
         }
 
-        let result_width = (input.width - template.width + 1) as usize;
-        let result_height = (input.height - template.height + 1) as usize;
-        let result_size = (result_width * result_height) as u64 * size_of::<f32>() as u64;
+        let result_width = input.width - template.width + 1;
+        let result_height = input.height - template.height + 1;
+        let result_buf_size = (result_width * result_height) as u64 * size_of::<f32>() as u64;
 
         if buffers_changed {
+            self.last_result_size = (result_width, result_height);
+
             self.result_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("result_buffer"),
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
-                size: result_size,
+                size: result_buf_size,
                 mapped_at_creation: false,
             }));
 
             self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("staging_buffer"),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                size: result_size,
+                size: result_buf_size,
                 mapped_at_creation: false,
             }));
 
@@ -400,30 +449,10 @@ impl TemplateMatcher {
             0,
             self.staging_buffer.as_ref().unwrap(),
             0,
-            result_size,
+            result_buf_size,
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
-
-        let buffer_slice = self.staging_buffer.as_ref().unwrap().slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-
-        self.device.poll(wgpu::Maintain::Wait);
-
-        pollster::block_on(async {
-            let result;
-
-            if let Some(Ok(())) = receiver.receive().await {
-                let data = buffer_slice.get_mapped_range();
-                result = bytemuck::cast_slice(&data).to_vec();
-                drop(data);
-                self.staging_buffer.as_ref().unwrap().unmap();
-            } else {
-                result = vec![0.0; result_width * result_height]
-            };
-
-            Image::new(result, result_width as _, result_height as _)
-        })
+        self.matching_ongoing = true;
     }
 }

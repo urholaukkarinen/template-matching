@@ -16,20 +16,16 @@ fn main() {
         let template_luma8 = template_image.to_luma8();
         let template_luma32f = template_image.to_luma32f();
 
+        // Start matching with GPU acceleration
         let time = Instant::now();
-        let result = matcher.match_template(
+        matcher.match_template(
             &input_luma32f,
             &template_luma32f,
             MatchTemplateMethod::SumOfSquaredDifferences,
         );
-        println!(
-            "template_matching::match_template took {} ms",
-            time.elapsed().as_millis()
-        );
+        let matcher_start_elapsed = time.elapsed();
 
-        let extremes = find_extremes(&result);
-        println!("{:?}", extremes);
-
+        // Start matching with imageproc
         let time = Instant::now();
         let result = imageproc::template_matching::match_template(
             &input_luma8,
@@ -40,8 +36,18 @@ fn main() {
             "imageproc::template_matching::match_template took {} ms",
             time.elapsed().as_millis()
         );
-
         let extremes = imageproc::template_matching::find_extremes(&result);
+        println!("{:?}", extremes);
+
+        // Get result from GPU accelerated matching
+        let time = Instant::now();
+        let result = matcher.wait_for_result().unwrap();
+        println!(
+            "template_matching::match_template took {:.2} ms",
+            (time.elapsed() + matcher_start_elapsed).as_micros() as f32 / 1000.0
+        );
+
+        let extremes = find_extremes(&result);
         println!("{:?}", extremes);
         println!();
     }
