@@ -10,7 +10,7 @@ GPU-accelerated template matching library for Rust. The crate is designed as a f
 
 ```bash
 [dependencies]
-template-matching = { version = "0.1.0", features = ["image"] }
+template-matching = { version = "0.2.0", features = ["image"] }
 ```
 
 ## Usage
