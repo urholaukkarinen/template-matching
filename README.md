@@ -26,8 +26,9 @@ fn main() {
     let result = match_template(&input_image, &template_image, MatchTemplateMethod::SumOfSquaredDifferences);
 
     // Or alternatively you can create the matcher first
-    let matcher = TemplateMatcher::new();
-    let result = matcher.match_template(&input_image, &template_image, MatchTemplateMethod::SumOfSquaredDifferences);
+    let mut matcher = TemplateMatcher::new();
+    matcher.match_template(&input_image, &template_image, MatchTemplateMethod::SumOfSquaredDifferences);
+    let result = matcher.wait_for_result().unwrap();
 
     // Calculate min & max values
     let extremes = find_extremes(&result);
